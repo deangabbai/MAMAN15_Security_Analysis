@@ -15,11 +15,8 @@ CMakeFiles/
 *.obj
 *.pdb
 
-# VCPKG build artifacts
-vcpkg/buildtrees/
-vcpkg/packages/
-vcpkg/downloads/
-vcpkg/installed/
+# VCPKG (should be added as submodule separately)
+vcpkg/
 vcpkg_installed/
 
 # Python
@@ -40,6 +37,8 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+*.db
+%SystemDrive%/
 
 # Runtime files
 *.info
