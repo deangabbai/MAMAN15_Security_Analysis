@@ -1,0 +1,51 @@
+# Build directories
+build/
+cmake-build-*/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.cmake
+CMakeCache.txt
+CMakeFiles/
+
+# Compiled binaries
+*.exe
+*.dll
+*.lib
+*.obj
+*.pdb
+
+# VCPKG build artifacts
+vcpkg/buildtrees/
+vcpkg/packages/
+vcpkg/downloads/
+vcpkg/installed/
+vcpkg_installed/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Runtime files
+*.info
+me.info
+
+# Logs
+*.log
+vcpkg-manifest-install.log
+

@@ -1,0 +1,9 @@
+{
+  "name": "defensive-maman15",
+  "version-string": "0.1.0",
+  "dependencies": [
+    "cryptopp"
+  ]
+}
+
+
