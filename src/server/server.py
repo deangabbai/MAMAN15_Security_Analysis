@@ -1,7 +1,8 @@
-"""MessageU server — milestones 1–5 minimal implementation."""
+"""MessageU server — milestones 1–7 implementation."""
 
 from __future__ import annotations
 
+import argparse
 import logging
 import socket
 import struct
@@ -10,7 +11,9 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Optional, Protocol, Tuple
+
+import sqlite3
 
 REQ_FMT = "<16sBHI"
 RESP_FMT = "<BHI"
@@ -37,12 +40,14 @@ RESP_ERROR = 9000
 MSG_TYPE_REQUEST_KEY = 1
 MSG_TYPE_SEND_KEY = 2
 MSG_TYPE_TEXT = 3
+MSG_TYPE_FILE = 4
 
-CLIENT_VERSION = 1
-SERVER_VERSION = 1
+CLIENT_VERSIONS = {1, 2}
 
 HOST = "0.0.0.0"
-MYPORT_PATH = Path(__file__).with_name("myport.info")
+SCRIPT_DIR = Path(__file__).resolve().parent
+MYPORT_PATH = SCRIPT_DIR / "myport.info"
+SQLITE_DB_PATH = SCRIPT_DIR / "defensive.db"
 DEFAULT_PORT = 1357
 
 _logger = logging.getLogger(__name__)
@@ -73,7 +78,9 @@ def read_port() -> int:
         _logger.warning("myport.info missing; defaulting to port %s", DEFAULT_PORT)
         return DEFAULT_PORT
     except OSError as exc:
-        _logger.warning("Failed to read %s (%s); defaulting to %s", MYPORT_PATH, exc, DEFAULT_PORT)
+        _logger.warning(
+            "Failed to read %s (%s); defaulting to %s", MYPORT_PATH, exc, DEFAULT_PORT
+        )
         return DEFAULT_PORT
 
     try:
@@ -106,11 +113,36 @@ class Message:
     content: bytes
 
 
+class Storage(Protocol):
+    def get_client_by_name(self, name: str) -> Optional[Client]:
+        """Return client by username."""
+
+    def get_client_by_id(self, client_id: bytes) -> Optional[Client]:
+        """Return client by identifier."""
+
+    def add_client(
+        self, client_id: bytes, name: str, pubkey: bytes, last_seen: datetime
+    ) -> Client:
+        """Persist a newly registered client."""
+
+    def list_clients_except(self, client_id: bytes) -> list[Client]:
+        """Return all clients except the provided one."""
+
+    def add_message(self, to: bytes, frm: bytes, typ: int, content: bytes) -> int:
+        """Persist a new message and return its identifier."""
+
+    def pop_all_messages_for(self, client_id: bytes) -> list[Message]:
+        """Return and remove all pending messages for a client."""
+
+    def update_last_seen(self, client_id: bytes, stamp: datetime) -> None:
+        """Update the last seen timestamp for the client."""
+
+
 class RAMStorage:
     def __init__(self) -> None:
         self._clients_by_id: dict[bytes, Client] = {}
         self._clients_by_name: dict[str, Client] = {}
-        self._message_queues: dict[bytes, List[Message]] = {}
+        self._message_queues: dict[bytes, list[Message]] = {}
         self._next_message_id = 1
         self._lock = threading.Lock()
 
@@ -122,25 +154,33 @@ class RAMStorage:
         with self._lock:
             return self._clients_by_id.get(client_id)
 
-    def add_client(self, client_id: bytes, name: str, pubkey: bytes, last_seen: datetime) -> Client:
+    def add_client(
+        self, client_id: bytes, name: str, pubkey: bytes, last_seen: datetime
+    ) -> Client:
         client = Client(client_id, name, pubkey, last_seen)
         with self._lock:
             self._clients_by_id[client_id] = client
             self._clients_by_name[name] = client
         return client
 
-    def list_clients_except(self, client_id: bytes) -> List[Client]:
+    def list_clients_except(self, client_id: bytes) -> list[Client]:
         with self._lock:
-            return [client for cid, client in self._clients_by_id.items() if cid != client_id]
+            return [
+                client
+                for cid, client in self._clients_by_id.items()
+                if cid != client_id
+            ]
 
     def add_message(self, to: bytes, frm: bytes, typ: int, content: bytes) -> int:
         with self._lock:
             mid = self._next_message_id
             self._next_message_id += 1
-            self._message_queues.setdefault(to, []).append(Message(mid, to, frm, typ, content))
+            self._message_queues.setdefault(to, []).append(
+                Message(mid, to, frm, typ, content)
+            )
             return mid
 
-    def pop_all_messages_for(self, client_id: bytes) -> List[Message]:
+    def pop_all_messages_for(self, client_id: bytes) -> list[Message]:
         with self._lock:
             return self._message_queues.pop(client_id, []).copy()
 
@@ -151,7 +191,143 @@ class RAMStorage:
                 client.last_seen = stamp
 
 
-VALID_MESSAGE_TYPES = {MSG_TYPE_REQUEST_KEY, MSG_TYPE_SEND_KEY, MSG_TYPE_TEXT}
+class SQLiteStorage:
+    def __init__(self, db_path: Path) -> None:
+        self._db_path = db_path
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        with self._conn:
+            self._conn.execute("PRAGMA foreign_keys=ON")
+        self._init_schema()
+
+    def _init_schema(self) -> None:
+        with self._conn:
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS clients(
+                    ID BLOB(16) PRIMARY KEY,
+                    UserName CHAR(255) NOT NULL,
+                    PublicKey BLOB(160) NOT NULL,
+                    LastSeen TEXT
+                );
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS messages(
+                    ID INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ToClient BLOB(16) NOT NULL,
+                    FromClient BLOB(16) NOT NULL,
+                    Type INTEGER NOT NULL,
+                    Content BLOB NOT NULL
+                );
+                """
+            )
+
+    def _row_to_client(self, row: sqlite3.Row) -> Client:
+        last_seen_raw = row["LastSeen"]
+        last_seen = (
+            datetime.fromisoformat(last_seen_raw)
+            if last_seen_raw
+            else datetime.now(timezone.utc)
+        )
+        return Client(
+            bytes(row["ID"]), str(row["UserName"]), bytes(row["PublicKey"]), last_seen
+        )
+
+    def get_client_by_name(self, name: str) -> Optional[Client]:
+        with self._lock:
+            cur = self._conn.execute("SELECT * FROM clients WHERE UserName= ?", (name,))
+            row = cur.fetchone()
+        if row is None:
+            return None
+        return self._row_to_client(row)
+
+    def get_client_by_id(self, client_id: bytes) -> Optional[Client]:
+        with self._lock:
+            cur = self._conn.execute("SELECT * FROM clients WHERE ID= ?", (client_id,))
+            row = cur.fetchone()
+        if row is None:
+            return None
+        return self._row_to_client(row)
+
+    def add_client(
+        self, client_id: bytes, name: str, pubkey: bytes, last_seen: datetime
+    ) -> Client:
+        stamp = last_seen.isoformat()
+        with self._lock:
+            with self._conn:
+                self._conn.execute(
+                    "INSERT INTO clients(ID, UserName, PublicKey, LastSeen) VALUES(?,?,?,?)",
+                    (client_id, name, pubkey, stamp),
+                )
+        return Client(client_id, name, pubkey, last_seen)
+
+    def list_clients_except(self, client_id: bytes) -> list[Client]:
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM clients WHERE ID<>? ORDER BY UserName COLLATE NOCASE",
+                (client_id,),
+            )
+            rows = cur.fetchall()
+        return [self._row_to_client(row) for row in rows]
+
+    def add_message(self, to: bytes, frm: bytes, typ: int, content: bytes) -> int:
+        with self._lock:
+            with self._conn:
+                cur = self._conn.execute(
+                    "INSERT INTO messages(ToClient, FromClient, Type, Content) VALUES(?,?,?,?)",
+                    (to, frm, typ, content),
+                )
+                message_id = cur.lastrowid
+        if message_id is None:
+            msg = "SQLite failed to return a row id for inserted message"
+            raise RuntimeError(msg)
+        return int(message_id)
+
+    def pop_all_messages_for(self, client_id: bytes) -> list[Message]:
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM messages WHERE ToClient=? ORDER BY ID",
+                (client_id,),
+            )
+            rows = cur.fetchall()
+            message_ids = [row["ID"] for row in rows]
+            messages = [
+                Message(
+                    int(row["ID"]),
+                    bytes(row["ToClient"]),
+                    bytes(row["FromClient"]),
+                    int(row["Type"]),
+                    bytes(row["Content"]),
+                )
+                for row in rows
+            ]
+            if message_ids:
+                placeholders = ",".join("?" for _ in message_ids)
+                with self._conn:
+                    self._conn.execute(
+                        f"DELETE FROM messages WHERE ID IN ({placeholders})",
+                        message_ids,
+                    )
+        return messages
+
+    def update_last_seen(self, client_id: bytes, stamp: datetime) -> None:
+        with self._lock:
+            with self._conn:
+                self._conn.execute(
+                    "UPDATE clients SET LastSeen=? WHERE ID=?",
+                    (stamp.isoformat(), client_id),
+                )
+
+
+VALID_MESSAGE_TYPES = {
+    MSG_TYPE_REQUEST_KEY,
+    MSG_TYPE_SEND_KEY,
+    MSG_TYPE_TEXT,
+    MSG_TYPE_FILE,
+}
 
 
 @dataclass(slots=True)
@@ -165,8 +341,9 @@ class RequestContext:
 
 
 class MessageUServer:
-    def __init__(self) -> None:
-        self._storage = RAMStorage()
+    def __init__(self, storage: Storage, server_version: int) -> None:
+        self._storage = storage
+        self._server_version = server_version
 
     def serve_forever(self) -> None:
         port = read_port()
@@ -178,7 +355,9 @@ class MessageUServer:
             while True:
                 conn, addr = srv.accept()
                 _logger.info("Accepted connection from %s", addr)
-                threading.Thread(target=self._handle_client, args=(conn, addr), daemon=True).start()
+                threading.Thread(
+                    target=self._handle_client, args=(conn, addr), daemon=True
+                ).start()
 
     def _handle_client(self, conn: socket.socket, addr: Tuple[str, int]) -> None:
         with conn:
@@ -193,9 +372,15 @@ class MessageUServer:
                     return
 
                 try:
-                    client_id, client_version, code, payload_size = unpack_req_header(header)
-                    if client_version != CLIENT_VERSION:
-                        _logger.warning("Unsupported client version %s from %s", client_version, addr)
+                    client_id, client_version, code, payload_size = unpack_req_header(
+                        header
+                    )
+                    if client_version not in CLIENT_VERSIONS:
+                        _logger.warning(
+                            "Unsupported client version %s from %s",
+                            client_version,
+                            addr,
+                        )
                         self._send_error(conn)
                         return
                     payload = read_exact(conn, payload_size) if payload_size else b""
@@ -204,11 +389,15 @@ class MessageUServer:
                     self._send_error(conn)
                     return
 
-                ctx = RequestContext(client_id, client_version, code, payload, conn, addr)
+                ctx = RequestContext(
+                    client_id, client_version, code, payload, conn, addr
+                )
                 try:
                     self._process_request(ctx)
                 except Exception:  # noqa: BLE001
-                    _logger.exception("Unhandled error processing code %s from %s", code, addr)
+                    _logger.exception(
+                        "Unhandled error processing code %s from %s", code, addr
+                    )
                     self._send_error(conn)
                     return
 
@@ -230,7 +419,9 @@ class MessageUServer:
     def _handle_register(self, ctx: RequestContext) -> None:
         expected_len = NAME_LEN + PUBKEY_LEN
         if len(ctx.payload) != expected_len:
-            _logger.warning("Invalid register payload size %s from %s", len(ctx.payload), ctx.addr)
+            _logger.warning(
+                "Invalid register payload size %s from %s", len(ctx.payload), ctx.addr
+            )
             self._send_error(ctx.conn)
             return
 
@@ -380,7 +571,7 @@ class MessageUServer:
                 return candidate
 
     def _send_response(self, conn: socket.socket, code: int, payload: bytes) -> None:
-        response = pack_resp(code, payload, SERVER_VERSION)
+        response = pack_resp(code, payload, self._server_version)
         try:
             conn.sendall(response)
         except OSError as exc:
@@ -388,14 +579,32 @@ class MessageUServer:
 
     def _send_error(self, conn: socket.socket) -> None:
         try:
-            conn.sendall(pack_resp(RESP_ERROR, b"", SERVER_VERSION))
+            conn.sendall(pack_resp(RESP_ERROR, b"", self._server_version))
         except OSError:
             pass
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(name)s: %(message)s")
-    server = MessageUServer()
+    parser = argparse.ArgumentParser(description="MessageU server")
+    parser.add_argument(
+        "--sqlite", action="store_true", help="Enable SQLite persistence"
+    )
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO, format="[%(asctime)s] %(levelname)s %(name)s: %(message)s"
+    )
+
+    if args.sqlite:
+        _logger.info("Starting server with SQLite persistence at %s", SQLITE_DB_PATH)
+        storage: Storage = SQLiteStorage(SQLITE_DB_PATH)
+        server_version = 2
+    else:
+        _logger.info("Starting server in RAM mode")
+        storage = RAMStorage()
+        server_version = 1
+
+    server = MessageUServer(storage, server_version)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

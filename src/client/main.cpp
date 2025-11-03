@@ -4,13 +4,20 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <limits>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
-#include <vector>
 #include <unordered_map>
+#include <vector>
+#include <cstdlib>
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
@@ -29,8 +36,8 @@ namespace messageu {
 constexpr std::size_t CLIENT_ID_LEN = 16;
 constexpr std::size_t NAME_LEN = 255;
 constexpr std::size_t PUBKEY_LEN = 160;
-constexpr std::uint8_t CLIENT_VERSION = 1;
-constexpr std::uint8_t SERVER_VERSION = 1;
+constexpr std::uint8_t CLIENT_VERSION = 2;
+constexpr std::array<std::uint8_t, 2> ACCEPTED_SERVER_VERSIONS{1, 2};
 
 constexpr std::uint16_t REQ_REGISTER = 600;
 constexpr std::uint16_t REQ_CLIENTS_LIST = 601;
@@ -48,6 +55,7 @@ constexpr std::uint16_t RESP_ERROR = 9000;
 constexpr std::uint8_t MSG_TYPE_REQUEST_KEY = 1;
 constexpr std::uint8_t MSG_TYPE_SEND_KEY = 2;
 constexpr std::uint8_t MSG_TYPE_TEXT = 3;
+constexpr std::uint8_t MSG_TYPE_FILE = 4;
 
 inline void appendLE16(std::vector<std::uint8_t>& out, std::uint16_t value) {
     out.push_back(static_cast<std::uint8_t>(value & 0xFF));
@@ -554,6 +562,7 @@ private:
                   << "150) Send a text message\n"
                   << "151) Send a request for symmetric key\n"
                   << "152) Send your symmetric key\n"
+                  << "153) Send a file\n"
                   << "0)   Exit client\n"
                   << "?";
     }
@@ -573,6 +582,8 @@ private:
             handleSendRequestKey();
         } else if (choice == "152") {
             handleSendSymmetricKey();
+        } else if (choice == "153") {
+            handleSendFile();
         } else {
             std::cout << "\nUnknown option.\n";
         }
@@ -717,7 +728,6 @@ private:
             offset += CLIENT_ID_LEN;
 
             std::uint32_t messageId = readLE32(response->payload.data() + offset);
-            (void)messageId;
             offset += 4;
 
             std::uint8_t type = response->payload[offset++];
@@ -765,6 +775,23 @@ private:
                     auto plaintext = aesTransform(false, *aesKeyOpt, content);
                     std::string text(plaintext.begin(), plaintext.end());
                     printMessageBlock(fromName, text);
+                } catch (const std::exception&) {
+                    printMessageBlock(fromName, "can't decrypt message");
+                }
+            } else if (type == MSG_TYPE_FILE) {
+                auto aesKeyOpt = keyStore_.findAesKey(fromId);
+                if (!aesKeyOpt) {
+                    printMessageBlock(fromName, "can't decrypt message");
+                    continue;
+                }
+                try {
+                    auto plaintext = aesTransform(false, *aesKeyOpt, content);
+                    auto saved = saveToTempFile(plaintext, messageId);
+                    if (!saved) {
+                        printMessageBlock(fromName, "can't decrypt message");
+                        continue;
+                    }
+                    printMessageBlock(fromName, saved->string());
                 } catch (const std::exception&) {
                     printMessageBlock(fromName, "can't decrypt message");
                 }
@@ -896,6 +923,101 @@ private:
         std::cout << "\nSymmetric key sent.\n";
     }
 
+    void handleSendFile() {
+        if (!ensureIdentity()) {
+            return;
+        }
+
+        auto targetOpt = prompt("Please enter the user name: ");
+        if (!targetOpt || !KeyStore::isAscii(*targetOpt)) {
+            std::cout << "\nName must be ASCII.\n";
+            return;
+        }
+
+        auto idOpt = keyStore_.findClientId(*targetOpt);
+        if (!idOpt) {
+            std::cout << "\nUnknown client. Fetch the clients list first.\n";
+            return;
+        }
+
+        auto aesKeyOpt = keyStore_.findAesKey(*idOpt);
+        if (!aesKeyOpt) {
+            std::cout << "\nNo symmetric key for this client. Request or exchange one first.\n";
+            return;
+        }
+
+        auto pathOpt = prompt("Please enter the file path: ");
+        if (!pathOpt || pathOpt->empty() || !KeyStore::isAscii(*pathOpt)) {
+            std::cout << "\nfile not found\n";
+            return;
+        }
+
+        std::filesystem::path absolutePath;
+        try {
+            absolutePath = std::filesystem::absolute(*pathOpt);
+        } catch (const std::exception&) {
+            std::cout << "\nfile not found\n";
+            return;
+        }
+
+        const std::string absoluteString = absolutePath.string();
+        if (!KeyStore::isAscii(absoluteString)) {
+            std::cout << "\nfile not found\n";
+            return;
+        }
+
+        try {
+            if (!std::filesystem::exists(absolutePath) || !std::filesystem::is_regular_file(absolutePath)) {
+                std::cout << "\nfile not found\n";
+                return;
+            }
+        } catch (const std::exception&) {
+            std::cout << "\nfile not found\n";
+            return;
+        }
+
+        std::vector<std::uint8_t> contents;
+        try {
+            const auto size = std::filesystem::file_size(absolutePath);
+            if (size > static_cast<std::uintmax_t>(std::numeric_limits<std::size_t>::max())) {
+                std::cout << "\nfile not found\n";
+                return;
+            }
+            contents.resize(static_cast<std::size_t>(size));
+            std::ifstream file(absolutePath, std::ios::binary);
+            if (!file.is_open()) {
+                std::cout << "\nfile not found\n";
+                return;
+            }
+            if (!contents.empty()) {
+                file.read(reinterpret_cast<char*>(contents.data()), static_cast<std::streamsize>(contents.size()));
+                if (!file) {
+                    std::cout << "\nfile not found\n";
+                    return;
+                }
+            }
+        } catch (const std::exception&) {
+            std::cout << "\nfile not found\n";
+            return;
+        }
+
+        auto ciphertext = aesTransform(true, *aesKeyOpt, contents);
+
+        std::vector<std::uint8_t> payload;
+        payload.reserve(CLIENT_ID_LEN + 1 + 4 + ciphertext.size());
+        payload.insert(payload.end(), idOpt->begin(), idOpt->end());
+        payload.push_back(MSG_TYPE_FILE);
+        appendLE32(payload, static_cast<std::uint32_t>(ciphertext.size()));
+        payload.insert(payload.end(), ciphertext.begin(), ciphertext.end());
+
+        auto response = sendRequest(REQ_SEND_MESSAGE, payload);
+        if (!response || response->code != RESP_MESSAGE_ACCEPTED) {
+            return;
+        }
+
+        std::cout << "\nFile sent.\n";
+    }
+
     bool ensureIdentity() const {
         if (!keyStore_.hasIdentity()) {
             std::cout << "\nPlease register first.\n";
@@ -927,7 +1049,8 @@ private:
 
             auto headerBytes = socket.readExact(7);
             auto header = parseResponseHeader(headerBytes.data());
-            if (header.version != SERVER_VERSION) {
+            if (std::find(ACCEPTED_SERVER_VERSIONS.begin(), ACCEPTED_SERVER_VERSIONS.end(), header.version) ==
+                ACCEPTED_SERVER_VERSIONS.end()) {
                 std::cout << "\nserver responded with an error\n";
                 return std::nullopt;
             }
@@ -945,6 +1068,55 @@ private:
             return Response{header.code, std::move(responsePayload)};
         } catch (const std::exception&) {
             std::cout << "\nserver responded with an error\n";
+            return std::nullopt;
+        }
+    }
+
+    static std::filesystem::path resolveTempDirectory() {
+        if (const char* tmp = std::getenv("TMP")) {
+            if (*tmp != '\0') {
+                return std::filesystem::path(tmp);
+            }
+        }
+        if (const char* temp = std::getenv("TEMP")) {
+            if (*temp != '\0') {
+                return std::filesystem::path(temp);
+            }
+        }
+        try {
+            return std::filesystem::temp_directory_path();
+        } catch (const std::exception&) {
+            try {
+                return std::filesystem::current_path();
+            } catch (const std::exception&) {
+                return std::filesystem::path{"."};
+            }
+        }
+    }
+
+    static std::optional<std::filesystem::path> saveToTempFile(const std::vector<std::uint8_t>& data,
+                                                               std::uint32_t messageId) {
+        try {
+            auto dir = resolveTempDirectory();
+            std::ostringstream name;
+            name << "MessageU_" << std::uppercase << std::hex << std::setw(8) << std::setfill('0') << messageId << ".tmp";
+            auto path = dir / name.str();
+            std::ofstream file(path, std::ios::binary | std::ios::trunc);
+            if (!file.is_open()) {
+                return std::nullopt;
+            }
+            if (!data.empty()) {
+                file.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+                if (!file) {
+                    return std::nullopt;
+                }
+            }
+            file.flush();
+            if (!file) {
+                return std::nullopt;
+            }
+            return path;
+        } catch (const std::exception&) {
             return std::nullopt;
         }
     }

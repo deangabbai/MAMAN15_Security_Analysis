@@ -1,0 +1,1445 @@
+ (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
+diff --git a/.gitignore b/.gitignore
+index c140031a1655b45e5b7db20a1640c374c4fd0dba..c17f4352036e98d6a105c1bd37080b99a7709383 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -18,33 +18,35 @@ CMakeFiles/
+ # VCPKG (should be added as submodule separately)
+ vcpkg/
+ vcpkg_installed/
+ 
+ # Python
+ __pycache__/
+ *.py[cod]
+ *$py.class
+ *.so
+ .Python
+ 
+ # IDE
+ .vs/
+ .vscode/
+ .idea/
+ *.swp
+ *.swo
+ *~
+ 
+ # OS
+ .DS_Store
+ Thumbs.db
+ *.db
+ %SystemDrive%/
+ 
+-# Runtime files
+-*.info
+-me.info
++# Runtime files
++*.info
++me.info
++!src/server/myport.info
++!src/client/server.info
+ 
+ # Logs
+ *.log
+ vcpkg-manifest-install.log
+ 
+diff --git a/README.md b/README.md
+index a49da0dfebd1e92266c5880d09adee531239163a..d641b66829df3077ceb223c7ebb87e7105ce5ae5 100644
+--- a/README.md
++++ b/README.md
+@@ -1,60 +1,67 @@
+-# MessageU Milestones 1-5 (Minimal)
++# MessageU Milestones 1–7 (Minimal + Bonuses)
+ 
+-This repository contains the leanest implementation that satisfies Milestones 1–5 of the MessageU assignment.
+-Only two source files and two configuration files are needed for the base spec.
++This repository contains the lean implementation that satisfies MessageU milestones 1–7:
++RAM server, SQLite persistence, and the file-transfer bonus. Only the required source and
++configuration files are shipped.
+ 
+ ## Layout
+ 
+ ```
+ src/
+ ├─ server/
+-│  ├─ server.py       # all protocol logic, RAM storage, handlers 600–604
++│  ├─ server.py       # handlers 600–604, RAM/SQLite storage, CLI --sqlite flag
+ │  └─ myport.info     # ASCII port (defaults to 1357 if unreadable)
+ └─ client/
+-   ├─ main.cpp        # Winsock client, menu 110–152, AES/RSA/Base64, me.info I/O
++   ├─ main.cpp        # Winsock client, menu 110–153, AES/RSA/Base64, file transfer
+    └─ server.info     # ASCII "IP:PORT" (e.g., 127.0.0.1:1357)
+ ```
+ 
+ `me.info` is generated after the first successful Register (110) and must contain:
+ 1. Username (ASCII)
+ 2. 32-character uppercase hex ClientID
+ 3. Base64 private key
+ 
+ ## Server (Python 3.12, stdlib only)
+ 
+ ```bash
+ uv venv
+ uv pip install ruff
++# RAM mode (Version=1)
+ uv run python src/server/server.py
++# SQLite mode (Version=2, persists to defensive.db)
++uv run python src/server/server.py --sqlite
+ ```
+ 
+-* Reads `myport.info` (falls back to 1357 with a warning if missing/malformed).
+-* Implements request/response packing, threading per connection, RAM storage, and handlers 600–604.
+-* Always responds with Version=1.
+-* Lint with `uv run ruff check src/server`.
++* Reads `myport.info`; default port 1357 if the file is missing or invalid.
++* Validates every payload and responds with 9000 on malformed input.
++* `--sqlite` enables persistent storage with the schema mandated by the assignment (queues pop on fetch).
++* Lint with `uv run ruff check src/server` and format with `uv run ruff format src/server`.
+ 
+ ## Client (Windows, VS 2022, Crypto++)
+ 
+ ```powershell
+ cmake --preset windows-msvc-x64
+ cmake --build --preset windows-msvc-x64 --config Release
+ ```
+ 
+-* Single translation unit (`src/client/main.cpp`) performing Winsock networking, LE packing,
+-  AES-128-CBC (IV=0), RSA-1024, Base64, and menu actions 110–152.
+-* Runtime files: `server.info`, `me.info` (created on first register).
+-* Exact strings required by the spec are emitted, including
+-  `server responded with an error`, `Request for symmetric key`, `symmetric key received.`,
+-  `can't decrypt message`, and the delimiter `-----<EOM>-----`.
++* Single translation unit performing Winsock networking, LE packing, AES-128-CBC (IV=0),
++  RSA-1024, Base64, and menu actions 110–153.
++* Runtime files: `server.info`, `me.info` (created after register).
++* Emits the exact strings required by the spec: `server responded with an error`,
++  `Request for symmetric key`, `symmetric key received.`, `can't decrypt message`,
++  `file not found`, and the delimiter `-----<EOM>-----`.
++* File transfer (153) encrypts with the cached AES key, uploads via message type 4, and saves
++  incoming files under `%TMP%/MessageU_XXXXXXXX.tmp`, printing the absolute path.
+ 
+-## Manual Test Checklist (M1–M5)
++## Manual Test Checklist (M1–M7)
+ 
+-1. Register two fresh clients (110) → each creates `me.info` and receives unique IDs.
+-2. Client B lists clients (120) → requester excluded, cache mappings.
++1. Register two fresh clients (110) → each creates `me.info` with a unique ID.
++2. Client B lists clients (120) → requester excluded, mappings cached.
+ 3. Client B retrieves Client A public key (130).
+ 4. Client B sends Type-1 request (151); Client A fetches (140) and sees `Request for symmetric key`.
+ 5. Client A fetches B’s key (130), sends Type-2 key (152); Client B fetches (140) and prints `symmetric key received.`.
+-6. Exchange encrypted text (150/140) successfully; missing keys trigger `can't decrypt message`.
+-7. Negative paths: duplicate username, malformed payload sizes, unknown IDs, wrong sizes → server replies 9000 and client prints `server responded with an error`.
+-
+-This baseline is intentionally compact so that later milestones (SQLite persistence, file transfer, security analysis) can build on top of it without undoing excess structure.
++6. Exchange encrypted text (150/140); without a cached key the client prints `can't decrypt message`.
++7. Run the server with `--sqlite`, repeat register/list/send, restart, and verify data persists.
++8. Exchange a file (153/140) with a cached AES key → sender prints `File sent.`, receiver prints the saved temp path.
++9. Negative paths: duplicate username, malformed payload sizes, unknown IDs, wrong sizes → server replies 9000 and the client
++   prints `server responded with an error`; decrypt failures show `can't decrypt message`; bad file paths show `file not found`.
+diff --git a/src/client/main.cpp b/src/client/main.cpp
+index 423fbd3dc8e24240906a8f3fd35c077181029c73..b33f695091bf7fae99c90213654a0eb884bdcacd 100644
+--- a/src/client/main.cpp
++++ b/src/client/main.cpp
+@@ -1,75 +1,80 @@
+ #include <algorithm>
+ #include <array>
+ #include <cctype>
+ #include <cstdint>
+-#include <filesystem>
+-#include <fstream>
+-#include <iostream>
+-#include <optional>
+-#include <stdexcept>
+-#include <string>
+-#include <vector>
+-#include <unordered_map>
++#include <filesystem>
++#include <fstream>
++#include <iomanip>
++#include <iostream>
++#include <limits>
++#include <optional>
++#include <sstream>
++#include <stdexcept>
++#include <string>
++#include <unordered_map>
++#include <vector>
++#include <cstdlib>
+ 
+ #include <winsock2.h>
+ #include <ws2tcpip.h>
+ 
+ #include <cryptopp/aes.h>
+ #include <cryptopp/base64.h>
+ #include <cryptopp/filters.h>
+ #include <cryptopp/modes.h>
+ #include <cryptopp/osrng.h>
+ #include <cryptopp/rsa.h>
+ 
+ #pragma comment(lib, "Ws2_32.lib")
+ #pragma comment(lib, "Bcrypt.lib")
+ 
+ namespace messageu {
+ 
+ constexpr std::size_t CLIENT_ID_LEN = 16;
+ constexpr std::size_t NAME_LEN = 255;
+ constexpr std::size_t PUBKEY_LEN = 160;
+-constexpr std::uint8_t CLIENT_VERSION = 1;
+-constexpr std::uint8_t SERVER_VERSION = 1;
++constexpr std::uint8_t CLIENT_VERSION = 2;
++constexpr std::array<std::uint8_t, 2> ACCEPTED_SERVER_VERSIONS{1, 2};
+ 
+ constexpr std::uint16_t REQ_REGISTER = 600;
+ constexpr std::uint16_t REQ_CLIENTS_LIST = 601;
+ constexpr std::uint16_t REQ_PUBLIC_KEY = 602;
+ constexpr std::uint16_t REQ_SEND_MESSAGE = 603;
+ constexpr std::uint16_t REQ_FETCH_MESSAGES = 604;
+ 
+ constexpr std::uint16_t RESP_REGISTER_OK = 2100;
+ constexpr std::uint16_t RESP_CLIENTS_LIST = 2101;
+ constexpr std::uint16_t RESP_PUBLIC_KEY = 2102;
+ constexpr std::uint16_t RESP_MESSAGE_ACCEPTED = 2103;
+ constexpr std::uint16_t RESP_WAITING_MESSAGES = 2104;
+ constexpr std::uint16_t RESP_ERROR = 9000;
+ 
+-constexpr std::uint8_t MSG_TYPE_REQUEST_KEY = 1;
+-constexpr std::uint8_t MSG_TYPE_SEND_KEY = 2;
+-constexpr std::uint8_t MSG_TYPE_TEXT = 3;
++constexpr std::uint8_t MSG_TYPE_REQUEST_KEY = 1;
++constexpr std::uint8_t MSG_TYPE_SEND_KEY = 2;
++constexpr std::uint8_t MSG_TYPE_TEXT = 3;
++constexpr std::uint8_t MSG_TYPE_FILE = 4;
+ 
+ inline void appendLE16(std::vector<std::uint8_t>& out, std::uint16_t value) {
+     out.push_back(static_cast<std::uint8_t>(value & 0xFF));
+     out.push_back(static_cast<std::uint8_t>((value >> 8) & 0xFF));
+ }
+ 
+ inline void appendLE32(std::vector<std::uint8_t>& out, std::uint32_t value) {
+     out.push_back(static_cast<std::uint8_t>(value & 0xFF));
+     out.push_back(static_cast<std::uint8_t>((value >> 8) & 0xFF));
+     out.push_back(static_cast<std::uint8_t>((value >> 16) & 0xFF));
+     out.push_back(static_cast<std::uint8_t>((value >> 24) & 0xFF));
+ }
+ 
+ inline std::uint16_t readLE16(const std::uint8_t* data) {
+     return static_cast<std::uint16_t>(data[0]) | (static_cast<std::uint16_t>(data[1]) << 8);
+ }
+ 
+ inline std::uint32_t readLE32(const std::uint8_t* data) {
+     return static_cast<std::uint32_t>(data[0]) | (static_cast<std::uint32_t>(data[1]) << 8) |
+            (static_cast<std::uint32_t>(data[2]) << 16) | (static_cast<std::uint32_t>(data[3]) << 24);
+ }
+ 
+ class Tcp {
+ public:
+     Tcp() : socket_(INVALID_SOCKET) {}
+@@ -525,80 +530,83 @@ private:
+         const auto colon = line.find(':');
+         if (colon == std::string::npos) {
+             throw std::runtime_error("server.info must be in IP:PORT format");
+         }
+ 
+         serverHost_ = line.substr(0, colon);
+         const std::string portStr = line.substr(colon + 1);
+         if (serverHost_.empty() || portStr.empty()) {
+             throw std::runtime_error("server.info missing host or port");
+         }
+ 
+         int portValue = 0;
+         try {
+             portValue = std::stoi(portStr);
+         } catch (const std::exception&) {
+             throw std::runtime_error("invalid port in server.info");
+         }
+ 
+         if (portValue < 1 || portValue > 65535) {
+             throw std::runtime_error("port in server.info out of range");
+         }
+         serverPort_ = static_cast<std::uint16_t>(portValue);
+     }
+ 
+     void showMenu() const {
+-        std::cout << "110) Register\n"
+-                  << "120) Request for clients list\n"
+-                  << "130) Request for public key\n"
+-                  << "140) Request for waiting messages\n"
+-                  << "150) Send a text message\n"
+-                  << "151) Send a request for symmetric key\n"
+-                  << "152) Send your symmetric key\n"
+-                  << "0)   Exit client\n"
+-                  << "?";
+-    }
++        std::cout << "110) Register\n"
++                  << "120) Request for clients list\n"
++                  << "130) Request for public key\n"
++                  << "140) Request for waiting messages\n"
++                  << "150) Send a text message\n"
++                  << "151) Send a request for symmetric key\n"
++                  << "152) Send your symmetric key\n"
++                  << "153) Send a file\n"
++                  << "0)   Exit client\n"
++                  << "?";
++    }
+ 
+     void handleChoice(const std::string& choice) {
+         if (choice == "110") {
+             handleRegister();
+         } else if (choice == "120") {
+             handleClientsList();
+         } else if (choice == "130") {
+             handlePublicKey();
+         } else if (choice == "140") {
+             handleFetchMessages();
+         } else if (choice == "150") {
+             handleSendText();
+-        } else if (choice == "151") {
+-            handleSendRequestKey();
+-        } else if (choice == "152") {
+-            handleSendSymmetricKey();
+-        } else {
+-            std::cout << "\nUnknown option.\n";
+-        }
+-    }
++        } else if (choice == "151") {
++            handleSendRequestKey();
++        } else if (choice == "152") {
++            handleSendSymmetricKey();
++        } else if (choice == "153") {
++            handleSendFile();
++        } else {
++            std::cout << "\nUnknown option.\n";
++        }
++    }
+ 
+     void handleRegister() {
+         if (keyStore_.hasIdentity()) {
+             std::cout << "\nRegistration refused: identity already exists in me.info.\n";
+             return;
+         }
+ 
+         auto usernameOpt = prompt("Please enter a username: ");
+         if (!usernameOpt) {
+             std::cout << "\nInvalid input.\n";
+             return;
+         }
+ 
+         const std::string username = *usernameOpt;
+         if (username.empty() || username.size() > NAME_LEN || !KeyStore::isAscii(username)) {
+             std::cout << "\nUsername must be 1-255 ASCII characters.\n";
+             return;
+         }
+ 
+         const auto keyPair = generateKeyPair();
+ 
+         std::vector<std::uint8_t> payload(NAME_LEN + PUBKEY_LEN, 0);
+         std::copy(username.begin(), username.end(), payload.begin());
+         payload[username.size()] = 0;
+         std::copy(keyPair.publicKey.begin(), keyPair.publicKey.end(), payload.begin() + NAME_LEN);
+@@ -694,107 +702,123 @@ private:
+         }
+ 
+         auto response = sendRequest(REQ_FETCH_MESSAGES, {});
+         if (!response || response->code != RESP_WAITING_MESSAGES) {
+             return;
+         }
+ 
+         if (response->payload.empty()) {
+             std::cout << "\nNo messages waiting.\n";
+             return;
+         }
+ 
+         std::size_t offset = 0;
+         while (offset < response->payload.size()) {
+             if (offset + CLIENT_ID_LEN + 1 + 8 > response->payload.size()) {
+                 std::cout << "\nserver responded with an error\n";
+                 return;
+             }
+ 
+             KeyStore::ClientId fromId{};
+             std::copy(response->payload.begin() + offset,
+                       response->payload.begin() + offset + CLIENT_ID_LEN,
+                       fromId.begin());
+             offset += CLIENT_ID_LEN;
+ 
+-            std::uint32_t messageId = readLE32(response->payload.data() + offset);
+-            (void)messageId;
+-            offset += 4;
+-
+-            std::uint8_t type = response->payload[offset++];
+-            std::uint32_t size = readLE32(response->payload.data() + offset);
+-            offset += 4;
++            std::uint32_t messageId = readLE32(response->payload.data() + offset);
++            offset += 4;
++
++            std::uint8_t type = response->payload[offset++];
++            std::uint32_t size = readLE32(response->payload.data() + offset);
++            offset += 4;
+ 
+             if (offset + size > response->payload.size()) {
+                 std::cout << "\nserver responded with an error\n";
+                 return;
+             }
+ 
+             std::vector<std::uint8_t> content(response->payload.begin() + offset,
+                                               response->payload.begin() + offset + size);
+             offset += size;
+ 
+             std::string fromName;
+             if (auto nameOpt = keyStore_.findClientName(fromId)) {
+                 fromName = *nameOpt;
+             } else {
+                 fromName = clientIdToHex(fromId);
+             }
+ 
+-            if (type == MSG_TYPE_REQUEST_KEY) {
+-                printMessageBlock(fromName, "Request for symmetric key");
+-            } else if (type == MSG_TYPE_SEND_KEY) {
+-                try {
+-                    auto plaintext = rsaDecrypt(keyStore_.privateKeyBase64(), content);
++            if (type == MSG_TYPE_REQUEST_KEY) {
++                printMessageBlock(fromName, "Request for symmetric key");
++            } else if (type == MSG_TYPE_SEND_KEY) {
++                try {
++                    auto plaintext = rsaDecrypt(keyStore_.privateKeyBase64(), content);
+                     if (plaintext.size() != AesKey{}.size()) {
+                         throw std::runtime_error("unexpected AES key size");
+                     }
+                     AesKey aesKey{};
+                     std::copy(plaintext.begin(), plaintext.end(), aesKey.begin());
+                     keyStore_.rememberAesKey(fromId, aesKey);
+                     printMessageBlock(fromName, "symmetric key received.");
+                 } catch (const std::exception&) {
+                     printMessageBlock(fromName, "can't decrypt message");
+                 }
+-            } else if (type == MSG_TYPE_TEXT) {
+-                auto aesKeyOpt = keyStore_.findAesKey(fromId);
+-                if (!aesKeyOpt) {
+-                    printMessageBlock(fromName, "can't decrypt message");
+-                    continue;
+-                }
+-                try {
+-                    auto plaintext = aesTransform(false, *aesKeyOpt, content);
+-                    std::string text(plaintext.begin(), plaintext.end());
+-                    printMessageBlock(fromName, text);
+-                } catch (const std::exception&) {
+-                    printMessageBlock(fromName, "can't decrypt message");
+-                }
+-            } else {
+-                printMessageBlock(fromName, "can't decrypt message");
+-            }
+-        }
+-    }
++            } else if (type == MSG_TYPE_TEXT) {
++                auto aesKeyOpt = keyStore_.findAesKey(fromId);
++                if (!aesKeyOpt) {
++                    printMessageBlock(fromName, "can't decrypt message");
++                    continue;
++                }
++                try {
++                    auto plaintext = aesTransform(false, *aesKeyOpt, content);
++                    std::string text(plaintext.begin(), plaintext.end());
++                    printMessageBlock(fromName, text);
++                } catch (const std::exception&) {
++                    printMessageBlock(fromName, "can't decrypt message");
++                }
++            } else if (type == MSG_TYPE_FILE) {
++                auto aesKeyOpt = keyStore_.findAesKey(fromId);
++                if (!aesKeyOpt) {
++                    printMessageBlock(fromName, "can't decrypt message");
++                    continue;
++                }
++                try {
++                    auto plaintext = aesTransform(false, *aesKeyOpt, content);
++                    auto saved = saveToTempFile(plaintext, messageId);
++                    if (!saved) {
++                        printMessageBlock(fromName, "can't decrypt message");
++                        continue;
++                    }
++                    printMessageBlock(fromName, saved->string());
++                } catch (const std::exception&) {
++                    printMessageBlock(fromName, "can't decrypt message");
++                }
++            } else {
++                printMessageBlock(fromName, "can't decrypt message");
++            }
++        }
++    }
+ 
+     void handleSendText() {
+         if (!ensureIdentity()) {
+             return;
+         }
+ 
+         auto targetOpt = prompt("Please enter the user name: ");
+         if (!targetOpt || !KeyStore::isAscii(*targetOpt)) {
+             std::cout << "\nName must be ASCII.\n";
+             return;
+         }
+ 
+         auto idOpt = keyStore_.findClientId(*targetOpt);
+         if (!idOpt) {
+             std::cout << "\nUnknown client. Fetch the clients list first.\n";
+             return;
+         }
+ 
+         auto aesKeyOpt = keyStore_.findAesKey(*idOpt);
+         if (!aesKeyOpt) {
+             std::cout << "\nNo symmetric key for this client. Request or exchange one first.\n";
+             return;
+         }
+ 
+         auto messageOpt = prompt("Please enter the message: ");
+@@ -830,150 +854,295 @@ private:
+         if (!targetOpt || !KeyStore::isAscii(*targetOpt)) {
+             std::cout << "\nName must be ASCII.\n";
+             return;
+         }
+ 
+         auto idOpt = keyStore_.findClientId(*targetOpt);
+         if (!idOpt) {
+             std::cout << "\nUnknown client. Fetch the clients list first.\n";
+             return;
+         }
+ 
+         std::vector<std::uint8_t> payload;
+         payload.reserve(CLIENT_ID_LEN + 1 + 4);
+         payload.insert(payload.end(), idOpt->begin(), idOpt->end());
+         payload.push_back(MSG_TYPE_REQUEST_KEY);
+         appendLE32(payload, 0);
+ 
+         auto response = sendRequest(REQ_SEND_MESSAGE, payload);
+         if (!response || response->code != RESP_MESSAGE_ACCEPTED) {
+             return;
+         }
+ 
+         std::cout << "\nSymmetric key request sent.\n";
+     }
+ 
+-    void handleSendSymmetricKey() {
+-        if (!ensureIdentity()) {
+-            return;
+-        }
+-
+-        auto targetOpt = prompt("Please enter the user name: ");
+-        if (!targetOpt || !KeyStore::isAscii(*targetOpt)) {
+-            std::cout << "\nName must be ASCII.\n";
+-            return;
+-        }
+-
+-        auto idOpt = keyStore_.findClientId(*targetOpt);
+-        if (!idOpt) {
+-            std::cout << "\nUnknown client. Fetch the clients list first.\n";
+-            return;
+-        }
+-
+-        auto pubKeyOpt = keyStore_.findPublicKey(*idOpt);
+-        if (!pubKeyOpt) {
+-            std::cout << "\nPublic key unknown. Request it first.\n";
+-            return;
+-        }
+-
+-        const auto aesKey = generateAesKey();
+-        keyStore_.rememberAesKey(*idOpt, aesKey);
+-
+-        std::vector<std::uint8_t> keyBytes(aesKey.begin(), aesKey.end());
+-        auto encrypted = rsaEncrypt(*pubKeyOpt, keyBytes);
+-
+-        std::vector<std::uint8_t> payload;
+-        payload.reserve(CLIENT_ID_LEN + 1 + 4 + encrypted.size());
+-        payload.insert(payload.end(), idOpt->begin(), idOpt->end());
+-        payload.push_back(MSG_TYPE_SEND_KEY);
+-        appendLE32(payload, static_cast<std::uint32_t>(encrypted.size()));
+-        payload.insert(payload.end(), encrypted.begin(), encrypted.end());
+-
+-        auto response = sendRequest(REQ_SEND_MESSAGE, payload);
+-        if (!response || response->code != RESP_MESSAGE_ACCEPTED) {
+-            return;
+-        }
+-
+-        std::cout << "\nSymmetric key sent.\n";
+-    }
+-
+-    bool ensureIdentity() const {
+-        if (!keyStore_.hasIdentity()) {
+-            std::cout << "\nPlease register first.\n";
+-            return false;
++    void handleSendSymmetricKey() {
++        if (!ensureIdentity()) {
++            return;
++        }
++
++        auto targetOpt = prompt("Please enter the user name: ");
++        if (!targetOpt || !KeyStore::isAscii(*targetOpt)) {
++            std::cout << "\nName must be ASCII.\n";
++            return;
++        }
++
++        auto idOpt = keyStore_.findClientId(*targetOpt);
++        if (!idOpt) {
++            std::cout << "\nUnknown client. Fetch the clients list first.\n";
++            return;
++        }
++
++        auto pubKeyOpt = keyStore_.findPublicKey(*idOpt);
++        if (!pubKeyOpt) {
++            std::cout << "\nPublic key unknown. Request it first.\n";
++            return;
++        }
++
++        const auto aesKey = generateAesKey();
++        keyStore_.rememberAesKey(*idOpt, aesKey);
++
++        std::vector<std::uint8_t> keyBytes(aesKey.begin(), aesKey.end());
++        auto encrypted = rsaEncrypt(*pubKeyOpt, keyBytes);
++
++        std::vector<std::uint8_t> payload;
++        payload.reserve(CLIENT_ID_LEN + 1 + 4 + encrypted.size());
++        payload.insert(payload.end(), idOpt->begin(), idOpt->end());
++        payload.push_back(MSG_TYPE_SEND_KEY);
++        appendLE32(payload, static_cast<std::uint32_t>(encrypted.size()));
++        payload.insert(payload.end(), encrypted.begin(), encrypted.end());
++
++        auto response = sendRequest(REQ_SEND_MESSAGE, payload);
++        if (!response || response->code != RESP_MESSAGE_ACCEPTED) {
++            return;
++        }
++
++        std::cout << "\nSymmetric key sent.\n";
++    }
++
++    void handleSendFile() {
++        if (!ensureIdentity()) {
++            return;
++        }
++
++        auto targetOpt = prompt("Please enter the user name: ");
++        if (!targetOpt || !KeyStore::isAscii(*targetOpt)) {
++            std::cout << "\nName must be ASCII.\n";
++            return;
++        }
++
++        auto idOpt = keyStore_.findClientId(*targetOpt);
++        if (!idOpt) {
++            std::cout << "\nUnknown client. Fetch the clients list first.\n";
++            return;
++        }
++
++        auto aesKeyOpt = keyStore_.findAesKey(*idOpt);
++        if (!aesKeyOpt) {
++            std::cout << "\nNo symmetric key for this client. Request or exchange one first.\n";
++            return;
++        }
++
++        auto pathOpt = prompt("Please enter the file path: ");
++        if (!pathOpt || pathOpt->empty() || !KeyStore::isAscii(*pathOpt)) {
++            std::cout << "\nfile not found\n";
++            return;
++        }
++
++        std::filesystem::path absolutePath;
++        try {
++            absolutePath = std::filesystem::absolute(*pathOpt);
++        } catch (const std::exception&) {
++            std::cout << "\nfile not found\n";
++            return;
++        }
++
++        const std::string absoluteString = absolutePath.string();
++        if (!KeyStore::isAscii(absoluteString)) {
++            std::cout << "\nfile not found\n";
++            return;
++        }
++
++        try {
++            if (!std::filesystem::exists(absolutePath) || !std::filesystem::is_regular_file(absolutePath)) {
++                std::cout << "\nfile not found\n";
++                return;
++            }
++        } catch (const std::exception&) {
++            std::cout << "\nfile not found\n";
++            return;
++        }
++
++        std::vector<std::uint8_t> contents;
++        try {
++            const auto size = std::filesystem::file_size(absolutePath);
++            if (size > static_cast<std::uintmax_t>(std::numeric_limits<std::size_t>::max())) {
++                std::cout << "\nfile not found\n";
++                return;
++            }
++            contents.resize(static_cast<std::size_t>(size));
++            std::ifstream file(absolutePath, std::ios::binary);
++            if (!file.is_open()) {
++                std::cout << "\nfile not found\n";
++                return;
++            }
++            if (!contents.empty()) {
++                file.read(reinterpret_cast<char*>(contents.data()), static_cast<std::streamsize>(contents.size()));
++                if (!file) {
++                    std::cout << "\nfile not found\n";
++                    return;
++                }
++            }
++        } catch (const std::exception&) {
++            std::cout << "\nfile not found\n";
++            return;
++        }
++
++        auto ciphertext = aesTransform(true, *aesKeyOpt, contents);
++
++        std::vector<std::uint8_t> payload;
++        payload.reserve(CLIENT_ID_LEN + 1 + 4 + ciphertext.size());
++        payload.insert(payload.end(), idOpt->begin(), idOpt->end());
++        payload.push_back(MSG_TYPE_FILE);
++        appendLE32(payload, static_cast<std::uint32_t>(ciphertext.size()));
++        payload.insert(payload.end(), ciphertext.begin(), ciphertext.end());
++
++        auto response = sendRequest(REQ_SEND_MESSAGE, payload);
++        if (!response || response->code != RESP_MESSAGE_ACCEPTED) {
++            return;
++        }
++
++        std::cout << "\nFile sent.\n";
++    }
++
++    bool ensureIdentity() const {
++        if (!keyStore_.hasIdentity()) {
++            std::cout << "\nPlease register first.\n";
++            return false;
+         }
+         return true;
+     }
+ 
+     struct Response {
+         std::uint16_t code{};
+         std::vector<std::uint8_t> payload;
+     };
+ 
+-    std::optional<Response> sendRequest(std::uint16_t code, const std::vector<std::uint8_t>& payload) {
+-        try {
+-            Tcp socket;
+-            socket.connect(serverHost_, serverPort_);
+-
+-            std::vector<std::uint8_t> buffer;
+-            buffer.reserve(16 + 1 + 2 + 4 + payload.size());
+-            const auto clientId = keyStore_.hasIdentity() ? keyStore_.clientId() : KeyStore::ClientId{};
+-            buffer.insert(buffer.end(), clientId.begin(), clientId.end());
+-            buffer.push_back(CLIENT_VERSION);
+-            appendLE16(buffer, code);
+-            appendLE32(buffer, static_cast<std::uint32_t>(payload.size()));
+-            buffer.insert(buffer.end(), payload.begin(), payload.end());
+-
+-            socket.sendAll(buffer);
+-
+-            auto headerBytes = socket.readExact(7);
+-            auto header = parseResponseHeader(headerBytes.data());
+-            if (header.version != SERVER_VERSION) {
+-                std::cout << "\nserver responded with an error\n";
+-                return std::nullopt;
+-            }
+-
+-            std::vector<std::uint8_t> responsePayload;
+-            if (header.payloadSize > 0) {
+-                responsePayload = socket.readExact(header.payloadSize);
+-            }
+-
+-            if (header.code == RESP_ERROR) {
+-                std::cout << "\nserver responded with an error\n";
+-                return std::nullopt;
+-            }
+-
+-            return Response{header.code, std::move(responsePayload)};
+-        } catch (const std::exception&) {
+-            std::cout << "\nserver responded with an error\n";
+-            return std::nullopt;
+-        }
+-    }
+-
+-    static void printMessageBlock(const std::string& fromName, const std::string& content) {
+-        std::cout << "\nFrom: " << fromName << "\nContent:\n" << content << "\n.\n.\n-----<EOM>-----\n";
+-    }
++    std::optional<Response> sendRequest(std::uint16_t code, const std::vector<std::uint8_t>& payload) {
++        try {
++            Tcp socket;
++            socket.connect(serverHost_, serverPort_);
++
++            std::vector<std::uint8_t> buffer;
++            buffer.reserve(16 + 1 + 2 + 4 + payload.size());
++            const auto clientId = keyStore_.hasIdentity() ? keyStore_.clientId() : KeyStore::ClientId{};
++            buffer.insert(buffer.end(), clientId.begin(), clientId.end());
++            buffer.push_back(CLIENT_VERSION);
++            appendLE16(buffer, code);
++            appendLE32(buffer, static_cast<std::uint32_t>(payload.size()));
++            buffer.insert(buffer.end(), payload.begin(), payload.end());
++
++            socket.sendAll(buffer);
++
++            auto headerBytes = socket.readExact(7);
++            auto header = parseResponseHeader(headerBytes.data());
++            if (std::find(ACCEPTED_SERVER_VERSIONS.begin(), ACCEPTED_SERVER_VERSIONS.end(), header.version) ==
++                ACCEPTED_SERVER_VERSIONS.end()) {
++                std::cout << "\nserver responded with an error\n";
++                return std::nullopt;
++            }
++
++            std::vector<std::uint8_t> responsePayload;
++            if (header.payloadSize > 0) {
++                responsePayload = socket.readExact(header.payloadSize);
++            }
++
++            if (header.code == RESP_ERROR) {
++                std::cout << "\nserver responded with an error\n";
++                return std::nullopt;
++            }
++
++            return Response{header.code, std::move(responsePayload)};
++        } catch (const std::exception&) {
++            std::cout << "\nserver responded with an error\n";
++            return std::nullopt;
++        }
++    }
++
++    static std::filesystem::path resolveTempDirectory() {
++        if (const char* tmp = std::getenv("TMP")) {
++            if (*tmp != '\0') {
++                return std::filesystem::path(tmp);
++            }
++        }
++        if (const char* temp = std::getenv("TEMP")) {
++            if (*temp != '\0') {
++                return std::filesystem::path(temp);
++            }
++        }
++        try {
++            return std::filesystem::temp_directory_path();
++        } catch (const std::exception&) {
++            try {
++                return std::filesystem::current_path();
++            } catch (const std::exception&) {
++                return std::filesystem::path{"."};
++            }
++        }
++    }
++
++    static std::optional<std::filesystem::path> saveToTempFile(const std::vector<std::uint8_t>& data,
++                                                               std::uint32_t messageId) {
++        try {
++            auto dir = resolveTempDirectory();
++            std::ostringstream name;
++            name << "MessageU_" << std::uppercase << std::hex << std::setw(8) << std::setfill('0') << messageId << ".tmp";
++            auto path = dir / name.str();
++            std::ofstream file(path, std::ios::binary | std::ios::trunc);
++            if (!file.is_open()) {
++                return std::nullopt;
++            }
++            if (!data.empty()) {
++                file.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
++                if (!file) {
++                    return std::nullopt;
++                }
++            }
++            file.flush();
++            if (!file) {
++                return std::nullopt;
++            }
++            return path;
++        } catch (const std::exception&) {
++            return std::nullopt;
++        }
++    }
++
++    static void printMessageBlock(const std::string& fromName, const std::string& content) {
++        std::cout << "\nFrom: " << fromName << "\nContent:\n" << content << "\n.\n.\n-----<EOM>-----\n";
++    }
+ 
+     static std::optional<std::string> prompt(const std::string& text) {
+         std::cout << '\n' << text;
+         std::string input;
+         if (!std::getline(std::cin, input)) {
+             return std::nullopt;
+         }
+         return input;
+     }
+ };
+ 
+ }  // namespace messageu
+ 
+ int main() {
+     WSADATA wsaData{};
+     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+         std::cerr << "Failed to initialize Winsock." << std::endl;
+         return 1;
+     }
+ 
+     int exitCode = 0;
+     try {
+         messageu::ClientApp app;
+         app.run();
+     } catch (const std::exception& ex) {
+diff --git a/src/client/server.info b/src/client/server.info
+new file mode 100644
+index 0000000000000000000000000000000000000000..60bce32eb64699c9c3ab871819ddadfe08394146
+--- /dev/null
++++ b/src/client/server.info
+@@ -0,0 +1 @@
++127.0.0.1:1357
+diff --git a/src/server/myport.info b/src/server/myport.info
+new file mode 100644
+index 0000000000000000000000000000000000000000..85a26ff86e07a673e87c0a826519c98f5510fc4d
+--- /dev/null
++++ b/src/server/myport.info
+@@ -0,0 +1 @@
++1357
+diff --git a/src/server/server.py b/src/server/server.py
+index 62b5bf482ad2c3180b1b968d96566df1db991130..7fdd268b36e10664a6aa9e3d294f9a2dbcacaf0d 100644
+--- a/src/server/server.py
++++ b/src/server/server.py
+@@ -1,258 +1,449 @@
+-"""MessageU server — milestones 1–5 minimal implementation."""
++"""MessageU server — milestones 1–7 implementation."""
+ 
+ from __future__ import annotations
+ 
++import argparse
+ import logging
+ import socket
+ import struct
+ import threading
+ import uuid
+ from dataclasses import dataclass
+ from datetime import datetime, timezone
+ from pathlib import Path
+-from typing import List, Optional, Tuple
++from typing import Optional, Protocol, Tuple
++
++import sqlite3
+ 
+ REQ_FMT = "<16sBHI"
+ RESP_FMT = "<BHI"
+ 
+ REQ_HEADER_LEN = struct.calcsize(REQ_FMT)
+ RESP_HEADER_LEN = struct.calcsize(RESP_FMT)
+ 
+ NAME_LEN = 255
+ PUBKEY_LEN = 160
+ 
+ REQ_REGISTER = 600
+ REQ_CLIENTS_LIST = 601
+ REQ_PUBLIC_KEY = 602
+ REQ_SEND_MESSAGE = 603
+ REQ_FETCH_MESSAGES = 604
+ 
+ RESP_REGISTER_OK = 2100
+ RESP_CLIENTS_LIST = 2101
+ RESP_PUBLIC_KEY = 2102
+ RESP_MESSAGE_ACCEPTED = 2103
+ RESP_WAITING_MESSAGES = 2104
+ RESP_ERROR = 9000
+ 
+ MSG_TYPE_REQUEST_KEY = 1
+ MSG_TYPE_SEND_KEY = 2
+ MSG_TYPE_TEXT = 3
++MSG_TYPE_FILE = 4
+ 
+-CLIENT_VERSION = 1
+-SERVER_VERSION = 1
++CLIENT_VERSIONS = {1, 2}
+ 
+ HOST = "0.0.0.0"
+-MYPORT_PATH = Path(__file__).with_name("myport.info")
++SCRIPT_DIR = Path(__file__).resolve().parent
++MYPORT_PATH = SCRIPT_DIR / "myport.info"
++SQLITE_DB_PATH = SCRIPT_DIR / "defensive.db"
+ DEFAULT_PORT = 1357
+ 
+ _logger = logging.getLogger(__name__)
+ 
+ 
+ def pack_resp(code: int, payload: bytes, version: int) -> bytes:
+     return struct.pack(RESP_FMT, version, code, len(payload)) + payload
+ 
+ 
+ def unpack_req_header(buf: bytes) -> Tuple[bytes, int, int, int]:
+     return struct.unpack(REQ_FMT, buf)
+ 
+ 
+ def read_exact(sock: socket.socket, size: int) -> bytes:
+     data = bytearray()
+     while len(data) < size:
+         chunk = sock.recv(size - len(data))
+         if not chunk:
+             raise ConnectionError("socket closed")
+         data.extend(chunk)
+     return bytes(data)
+ 
+ 
+ def read_port() -> int:
+     try:
+         text = MYPORT_PATH.read_text(encoding="ascii").strip()
+     except FileNotFoundError:
+         _logger.warning("myport.info missing; defaulting to port %s", DEFAULT_PORT)
+         return DEFAULT_PORT
+     except OSError as exc:
+-        _logger.warning("Failed to read %s (%s); defaulting to %s", MYPORT_PATH, exc, DEFAULT_PORT)
++        _logger.warning(
++            "Failed to read %s (%s); defaulting to %s", MYPORT_PATH, exc, DEFAULT_PORT
++        )
+         return DEFAULT_PORT
+ 
+     try:
+         port = int(text)
+     except ValueError:
+         _logger.warning("Invalid port '%s'; defaulting to %s", text, DEFAULT_PORT)
+         return DEFAULT_PORT
+ 
+     if 1 <= port <= 65535:
+         return port
+ 
+     _logger.warning("Out-of-range port %s; defaulting to %s", port, DEFAULT_PORT)
+     return DEFAULT_PORT
+ 
+ 
+ @dataclass(slots=True)
+ class Client:
+     id: bytes
+     name: str
+     pubkey: bytes
+     last_seen: datetime
+ 
+ 
+ @dataclass(slots=True)
+ class Message:
+     id: int
+     to: bytes
+     frm: bytes
+     typ: int
+     content: bytes
+ 
+ 
++class Storage(Protocol):
++    def get_client_by_name(self, name: str) -> Optional[Client]:
++        """Return client by username."""
++
++    def get_client_by_id(self, client_id: bytes) -> Optional[Client]:
++        """Return client by identifier."""
++
++    def add_client(
++        self, client_id: bytes, name: str, pubkey: bytes, last_seen: datetime
++    ) -> Client:
++        """Persist a newly registered client."""
++
++    def list_clients_except(self, client_id: bytes) -> list[Client]:
++        """Return all clients except the provided one."""
++
++    def add_message(self, to: bytes, frm: bytes, typ: int, content: bytes) -> int:
++        """Persist a new message and return its identifier."""
++
++    def pop_all_messages_for(self, client_id: bytes) -> list[Message]:
++        """Return and remove all pending messages for a client."""
++
++    def update_last_seen(self, client_id: bytes, stamp: datetime) -> None:
++        """Update the last seen timestamp for the client."""
++
++
+ class RAMStorage:
+     def __init__(self) -> None:
+         self._clients_by_id: dict[bytes, Client] = {}
+         self._clients_by_name: dict[str, Client] = {}
+-        self._message_queues: dict[bytes, List[Message]] = {}
++        self._message_queues: dict[bytes, list[Message]] = {}
+         self._next_message_id = 1
+         self._lock = threading.Lock()
+ 
+     def get_client_by_name(self, name: str) -> Optional[Client]:
+         with self._lock:
+             return self._clients_by_name.get(name)
+ 
+     def get_client_by_id(self, client_id: bytes) -> Optional[Client]:
+         with self._lock:
+             return self._clients_by_id.get(client_id)
+ 
+-    def add_client(self, client_id: bytes, name: str, pubkey: bytes, last_seen: datetime) -> Client:
++    def add_client(
++        self, client_id: bytes, name: str, pubkey: bytes, last_seen: datetime
++    ) -> Client:
+         client = Client(client_id, name, pubkey, last_seen)
+         with self._lock:
+             self._clients_by_id[client_id] = client
+             self._clients_by_name[name] = client
+         return client
+ 
+-    def list_clients_except(self, client_id: bytes) -> List[Client]:
++    def list_clients_except(self, client_id: bytes) -> list[Client]:
+         with self._lock:
+-            return [client for cid, client in self._clients_by_id.items() if cid != client_id]
++            return [
++                client
++                for cid, client in self._clients_by_id.items()
++                if cid != client_id
++            ]
+ 
+     def add_message(self, to: bytes, frm: bytes, typ: int, content: bytes) -> int:
+         with self._lock:
+             mid = self._next_message_id
+             self._next_message_id += 1
+-            self._message_queues.setdefault(to, []).append(Message(mid, to, frm, typ, content))
++            self._message_queues.setdefault(to, []).append(
++                Message(mid, to, frm, typ, content)
++            )
+             return mid
+ 
+-    def pop_all_messages_for(self, client_id: bytes) -> List[Message]:
++    def pop_all_messages_for(self, client_id: bytes) -> list[Message]:
+         with self._lock:
+             return self._message_queues.pop(client_id, []).copy()
+ 
+     def update_last_seen(self, client_id: bytes, stamp: datetime) -> None:
+         with self._lock:
+             client = self._clients_by_id.get(client_id)
+             if client is not None:
+                 client.last_seen = stamp
+ 
+ 
+-VALID_MESSAGE_TYPES = {MSG_TYPE_REQUEST_KEY, MSG_TYPE_SEND_KEY, MSG_TYPE_TEXT}
++class SQLiteStorage:
++    def __init__(self, db_path: Path) -> None:
++        self._db_path = db_path
++        self._lock = threading.Lock()
++        self._conn = sqlite3.connect(db_path, check_same_thread=False)
++        self._conn.row_factory = sqlite3.Row
++        with self._conn:
++            self._conn.execute("PRAGMA foreign_keys=ON")
++        self._init_schema()
++
++    def _init_schema(self) -> None:
++        with self._conn:
++            self._conn.execute(
++                """
++                CREATE TABLE IF NOT EXISTS clients(
++                    ID BLOB(16) PRIMARY KEY,
++                    UserName CHAR(255) NOT NULL,
++                    PublicKey BLOB(160) NOT NULL,
++                    LastSeen TEXT
++                );
++                """
++            )
++            self._conn.execute(
++                """
++                CREATE TABLE IF NOT EXISTS messages(
++                    ID INTEGER PRIMARY KEY AUTOINCREMENT,
++                    ToClient BLOB(16) NOT NULL,
++                    FromClient BLOB(16) NOT NULL,
++                    Type INTEGER NOT NULL,
++                    Content BLOB NOT NULL
++                );
++                """
++            )
++
++    def _row_to_client(self, row: sqlite3.Row) -> Client:
++        last_seen_raw = row["LastSeen"]
++        last_seen = (
++            datetime.fromisoformat(last_seen_raw)
++            if last_seen_raw
++            else datetime.now(timezone.utc)
++        )
++        return Client(
++            bytes(row["ID"]), str(row["UserName"]), bytes(row["PublicKey"]), last_seen
++        )
++
++    def get_client_by_name(self, name: str) -> Optional[Client]:
++        with self._lock:
++            cur = self._conn.execute("SELECT * FROM clients WHERE UserName=?", (name,))
++            row = cur.fetchone()
++        if row is None:
++            return None
++        return self._row_to_client(row)
++
++    def get_client_by_id(self, client_id: bytes) -> Optional[Client]:
++        with self._lock:
++            cur = self._conn.execute("SELECT * FROM clients WHERE ID=?", (client_id,))
++            row = cur.fetchone()
++        if row is None:
++            return None
++        return self._row_to_client(row)
++
++    def add_client(
++        self, client_id: bytes, name: str, pubkey: bytes, last_seen: datetime
++    ) -> Client:
++        stamp = last_seen.isoformat()
++        with self._lock:
++            with self._conn:
++                self._conn.execute(
++                    "INSERT INTO clients(ID, UserName, PublicKey, LastSeen) VALUES(?,?,?,?)",
++                    (client_id, name, pubkey, stamp),
++                )
++        return Client(client_id, name, pubkey, last_seen)
++
++    def list_clients_except(self, client_id: bytes) -> list[Client]:
++        with self._lock:
++            cur = self._conn.execute(
++                "SELECT * FROM clients WHERE ID<>? ORDER BY UserName COLLATE NOCASE",
++                (client_id,),
++            )
++            rows = cur.fetchall()
++        return [self._row_to_client(row) for row in rows]
++
++    def add_message(self, to: bytes, frm: bytes, typ: int, content: bytes) -> int:
++        with self._lock:
++            with self._conn:
++                cur = self._conn.execute(
++                    "INSERT INTO messages(ToClient, FromClient, Type, Content) VALUES(?,?,?,?)",
++                    (to, frm, typ, content),
++                )
++                message_id = cur.lastrowid
++        if message_id is None:
++            msg = "SQLite failed to return a row id for inserted message"
++            raise RuntimeError(msg)
++        return int(message_id)
++
++    def pop_all_messages_for(self, client_id: bytes) -> list[Message]:
++        with self._lock:
++            cur = self._conn.execute(
++                "SELECT * FROM messages WHERE ToClient=? ORDER BY ID",
++                (client_id,),
++            )
++            rows = cur.fetchall()
++            message_ids = [row["ID"] for row in rows]
++            messages = [
++                Message(
++                    int(row["ID"]),
++                    bytes(row["ToClient"]),
++                    bytes(row["FromClient"]),
++                    int(row["Type"]),
++                    bytes(row["Content"]),
++                )
++                for row in rows
++            ]
++            if message_ids:
++                placeholders = ",".join("?" for _ in message_ids)
++                with self._conn:
++                    self._conn.execute(
++                        f"DELETE FROM messages WHERE ID IN ({placeholders})",
++                        message_ids,
++                    )
++        return messages
++
++    def update_last_seen(self, client_id: bytes, stamp: datetime) -> None:
++        with self._lock:
++            with self._conn:
++                self._conn.execute(
++                    "UPDATE clients SET LastSeen=? WHERE ID=?",
++                    (stamp.isoformat(), client_id),
++                )
++
++
++VALID_MESSAGE_TYPES = {
++    MSG_TYPE_REQUEST_KEY,
++    MSG_TYPE_SEND_KEY,
++    MSG_TYPE_TEXT,
++    MSG_TYPE_FILE,
++}
+ 
+ 
+ @dataclass(slots=True)
+ class RequestContext:
+     client_id: bytes
+     client_version: int
+     code: int
+     payload: bytes
+     conn: socket.socket
+     addr: Tuple[str, int]
+ 
+ 
+ class MessageUServer:
+-    def __init__(self) -> None:
+-        self._storage = RAMStorage()
++    def __init__(self, storage: Storage, server_version: int) -> None:
++        self._storage = storage
++        self._server_version = server_version
+ 
+     def serve_forever(self) -> None:
+         port = read_port()
+         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
+             srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+             srv.bind((HOST, port))
+             srv.listen()
+             _logger.info("Server listening on %s:%s", HOST, port)
+             while True:
+                 conn, addr = srv.accept()
+                 _logger.info("Accepted connection from %s", addr)
+-                threading.Thread(target=self._handle_client, args=(conn, addr), daemon=True).start()
++                threading.Thread(
++                    target=self._handle_client, args=(conn, addr), daemon=True
++                ).start()
+ 
+     def _handle_client(self, conn: socket.socket, addr: Tuple[str, int]) -> None:
+         with conn:
+             while True:
+                 try:
+                     header = read_exact(conn, REQ_HEADER_LEN)
+                 except ConnectionError:
+                     _logger.info("Connection from %s closed", addr)
+                     return
+                 except OSError as exc:
+                     _logger.warning("Socket error from %s: %s", addr, exc)
+                     return
+ 
+                 try:
+-                    client_id, client_version, code, payload_size = unpack_req_header(header)
+-                    if client_version != CLIENT_VERSION:
+-                        _logger.warning("Unsupported client version %s from %s", client_version, addr)
++                    client_id, client_version, code, payload_size = unpack_req_header(
++                        header
++                    )
++                    if client_version not in CLIENT_VERSIONS:
++                        _logger.warning(
++                            "Unsupported client version %s from %s",
++                            client_version,
++                            addr,
++                        )
+                         self._send_error(conn)
+                         return
+                     payload = read_exact(conn, payload_size) if payload_size else b""
+                 except Exception as exc:  # noqa: BLE001
+                     _logger.warning("Malformed request from %s: %s", addr, exc)
+                     self._send_error(conn)
+                     return
+ 
+-                ctx = RequestContext(client_id, client_version, code, payload, conn, addr)
++                ctx = RequestContext(
++                    client_id, client_version, code, payload, conn, addr
++                )
+                 try:
+                     self._process_request(ctx)
+                 except Exception:  # noqa: BLE001
+-                    _logger.exception("Unhandled error processing code %s from %s", code, addr)
++                    _logger.exception(
++                        "Unhandled error processing code %s from %s", code, addr
++                    )
+                     self._send_error(conn)
+                     return
+ 
+     def _process_request(self, ctx: RequestContext) -> None:
+         if ctx.code == REQ_REGISTER:
+             self._handle_register(ctx)
+         elif ctx.code == REQ_CLIENTS_LIST:
+             self._handle_clients_list(ctx)
+         elif ctx.code == REQ_PUBLIC_KEY:
+             self._handle_public_key(ctx)
+         elif ctx.code == REQ_SEND_MESSAGE:
+             self._handle_send_message(ctx)
+         elif ctx.code == REQ_FETCH_MESSAGES:
+             self._handle_fetch_messages(ctx)
+         else:
+             _logger.warning("Unknown request code %s from %s", ctx.code, ctx.addr)
+             self._send_error(ctx.conn)
+ 
+     def _handle_register(self, ctx: RequestContext) -> None:
+         expected_len = NAME_LEN + PUBKEY_LEN
+         if len(ctx.payload) != expected_len:
+-            _logger.warning("Invalid register payload size %s from %s", len(ctx.payload), ctx.addr)
++            _logger.warning(
++                "Invalid register payload size %s from %s", len(ctx.payload), ctx.addr
++            )
+             self._send_error(ctx.conn)
+             return
+ 
+         name_field = ctx.payload[:NAME_LEN]
+         pubkey = ctx.payload[NAME_LEN:]
+         if len(pubkey) != PUBKEY_LEN:
+             self._send_error(ctx.conn)
+             return
+ 
+         if b"\x00" not in name_field:
+             _logger.warning("Register payload missing NUL from %s", ctx.addr)
+             self._send_error(ctx.conn)
+             return
+ 
+         raw_name, _ = name_field.split(b"\x00", 1)
+         if not raw_name:
+             _logger.warning("Empty username from %s", ctx.addr)
+             self._send_error(ctx.conn)
+             return
+ 
+         try:
+             name = raw_name.decode("ascii")
+         except UnicodeDecodeError:
+             _logger.warning("Non-ASCII username from %s", ctx.addr)
+             self._send_error(ctx.conn)
+@@ -358,49 +549,67 @@ class MessageUServer:
+                 + struct.pack("<I", message.id)
+                 + bytes([message.typ])
+                 + struct.pack("<I", content_size)
+                 + message.content
+             )
+             blocks.append(block)
+ 
+         payload = b"".join(blocks)
+         self._send_response(ctx.conn, RESP_WAITING_MESSAGES, payload)
+ 
+     def _require_client(self, ctx: RequestContext) -> Optional[Client]:
+         client = self._storage.get_client_by_id(ctx.client_id)
+         if client is None:
+             self._send_error(ctx.conn)
+             return None
+         self._storage.update_last_seen(client.id, datetime.now(timezone.utc))
+         return client
+ 
+     def _generate_unique_client_id(self) -> bytes:
+         while True:
+             candidate = uuid.uuid4().bytes
+             if self._storage.get_client_by_id(candidate) is None:
+                 return candidate
+ 
+     def _send_response(self, conn: socket.socket, code: int, payload: bytes) -> None:
+-        response = pack_resp(code, payload, SERVER_VERSION)
++        response = pack_resp(code, payload, self._server_version)
+         try:
+             conn.sendall(response)
+         except OSError as exc:
+             _logger.warning("Failed to send response: %s", exc)
+ 
+     def _send_error(self, conn: socket.socket) -> None:
+         try:
+-            conn.sendall(pack_resp(RESP_ERROR, b"", SERVER_VERSION))
++            conn.sendall(pack_resp(RESP_ERROR, b"", self._server_version))
+         except OSError:
+             pass
+ 
+ 
+ def main() -> None:
+-    logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(name)s: %(message)s")
+-    server = MessageUServer()
++    parser = argparse.ArgumentParser(description="MessageU server")
++    parser.add_argument(
++        "--sqlite", action="store_true", help="Enable SQLite persistence"
++    )
++    args = parser.parse_args()
++
++    logging.basicConfig(
++        level=logging.INFO, format="[%(asctime)s] %(levelname)s %(name)s: %(message)s"
++    )
++
++    if args.sqlite:
++        _logger.info("Starting server with SQLite persistence at %s", SQLITE_DB_PATH)
++        storage: Storage = SQLiteStorage(SQLITE_DB_PATH)
++        server_version = 2
++    else:
++        _logger.info("Starting server in RAM mode")
++        storage = RAMStorage()
++        server_version = 1
++
++    server = MessageUServer(storage, server_version)
+     try:
+         server.serve_forever()
+     except KeyboardInterrupt:
+         _logger.info("Shutdown requested")
+ 
+ 
+ if __name__ == "__main__":
+-    main()
++    main()
+ 
+EOF
+)
